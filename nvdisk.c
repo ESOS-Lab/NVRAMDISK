@@ -323,7 +323,7 @@ static void copy_to_nvdisk(struct nvdisk_device *nvdisk, const void *src,
 	{
 		printk(KERN_ALERT"nvrdisk: page_dest NULL");
 //		pram_err("page_dest is NULL\n");
-		page_dest = alloc_page( GFP_KERNEL | __GFP_NVRAM);
+		page_dest = alloc_page( GFP_KERNEL/* | __GFP_NVRAM*/);
 		
 		
 //		memcpy(__va(PFN_PHYS(page_to_pfn(page_dest))), src, size);
@@ -450,7 +450,7 @@ static void copy_to_nvdisk(struct nvdisk_device *nvdisk, const void *src,
 		if(page_dest == NULL)
 		{
 	//		pram_err("page_dest is NULL\n");
-			page_dest = alloc_page( GFP_KERNEL | __GFP_NVRAM);
+			page_dest = alloc_page( GFP_KERNEL/* | __GFP_NVRAM*/);
 			
 			
 	//		memcpy(__va(PFN_PHYS(page_to_pfn(page_dest))), src, size);
@@ -780,7 +780,7 @@ static const struct block_device_operations nvdisk_fops = {
  * And now the modules code and kernel interface.
  */
 static int nvrd_nr;
-int nvrd_size = 1500000;//CONFIG_BLK_DEV_RAM_SIZE;
+int nvrd_size = 1024*1024*2;//CONFIG_BLK_DEV_RAM_SIZE;
 static int max_part;
 static int part_shift;
 module_param(nvrd_nr, int, 0);
@@ -848,11 +848,12 @@ static struct nvdisk_device *nvdisk_alloc(int i)
 	disk->queue		= nvdisk->nvdisk_queue;
 	disk->flags |= GENHD_FL_SUPPRESS_PARTITION_INFO;
 	sprintf(disk->disk_name, "nvram%d", i);
-	set_capacity(disk, nvrd_size);
+	set_capacity(disk, nvrd_size/* *2 */);
+	
 	printk(KERN_ALERT"nvdisk: manage_map alloc");
 	nvdisk_manage = kzalloc(sizeof(struct manage_map), GFP_ATOMIC);
 	nvdisk->nvdisk_manage = nvdisk_manage;
-	nvdisk->nvdisk_manage->start = vmalloc(nvrd_size*1024);
+	nvdisk->nvdisk_manage->start = vmalloc(nvrd_size*512);
 	printk(KERN_ALERT"nvdisk: partition alloc %x", nvdisk->nvdisk_manage->start);
 	nvdisk->nvdisk_manage->	shadow_start = vmalloc(PAGE_SIZE * NUMOFSHADOW);
 	printk(KERN_ALERT"nvdisk: shadow block alloc %x", nvdisk->nvdisk_manage->shadow_start);
@@ -952,6 +953,7 @@ static int __init nvdisk_init(void)
 	 *     device on-demand.
 	 */
 	nvrd_nr = 1;
+//	nvrd_size = 1024*1024*2;
 	
 	part_shift = 0;
 	if (max_part > 0)
