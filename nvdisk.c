@@ -29,6 +29,10 @@
 #include <asm/tlbflush.h>
 #include <asm/pgalloc.h>
 #include <asm/pgtable_types.h>
+#include <asm/tsc.h>
+
+#define NVRAMDISK_TIMECHECK
+#define NVRAMDISK_DEBUG
 
 #define NVRAMDISK_MAJOR		262
 #define NUMOFSHADOW 32
@@ -50,6 +54,153 @@
 	unsigned long long l2;
 } shadow_variables;
 
+unsigned long (*lv_table)[4];
+spinlock_t * nvramdisk_tslock;
+
+void subset_lock_init();
+void tslock(unsigned long addr)
+{
+	int i;
+	i = addr / cache_line_size();
+	spin_lock(&nvramdisk_tslock[i]);
+	
+}
+void tsunlock(unsigned long addr)
+{
+	int i;
+	i = addr / cache_line_size();
+	spin_unlock(&nvramdisk_tslock[i]);
+}
+
+void lv_table_init()
+{
+	int cache_line_size;
+	int data_line_size;
+	int channel;
+	int word_size;
+	int memio_unit = data_line_size * channel;
+	int imax, jmax;
+	int i,j,n;
+	int total_size;
+	
+	//total_size = NUMOFSHADOW*3;
+	cache_line_size = cache_line_size();
+	channel = 2;
+	word_size = sizeof(unsigned long);
+	data_line_size=8;//64bit
+	
+	
+	jmax = cache_line_size / memio_unit;
+	imax = memio_unit / word_size;	
+	
+	if(jmax<3)
+	{
+		printk(KERN_ALERT"jmax<3");		
+	}
+	
+	lv_table = (unsigned long (*)[4])kzalloc(NUMOFSHADOW*4*sizeof(unsigned long), GFP_KERNEL);
+
+
+		
+	
+	for(n=0; n<NUMOFSHADOW; n++)
+	{
+		j = i-(i%4);
+		jmax = j+4;
+		i=n%4;
+
+		while(j<jmax)
+		{
+			lv_table[j][i]=0;
+			j++;
+		}
+	}
+	
+
+}
+void lv_table_update(int i, unsigned long addr)
+{
+	int j,n, jmax;
+	
+	j = i-(i%4);
+	jmax = j+4;
+	i=n%4;
+
+	while(j<jmax)
+	{
+		lv_table[j][i]=addr;
+		j++;
+	}
+	clflush_cache_range(&lv_table[j][i], sizeof(unsigned long));	
+}
+void lv_table_clear(int i)
+{
+	int j,n, jmax;
+	
+	j = i-(i%4);
+	jmax = j+4;
+	i=n%4;
+
+	while(j<jmax)
+	{
+		lv_table[j][i]=0;
+		j++;
+	}
+	clflush_cache_range(&lv_table[j][i], sizeof(unsigned long));	
+}
+
+int nvramdisk_mapping_table_init(struct nvdisk_device* nvdisk);
+
+
+unsigned long table_update(unsigned long *mt1, unsigned long idx, unsigned long addr)
+{
+	// 3 level mapping table 10 10 10
+	int n = PAGE_SIZE / sizeof(unsigned long);
+
+	int idx1, idx2, idx3;
+	unsigned long * mt2, *mt3, entry;
+	struct page* page1, page2, page3;
+	
+	//overflow test
+
+	idx1 = idx / n*n * PAGE_SIZE;
+	idx2 = idx / n*PAGE_SIZE;
+	idx3 = idx / PAGE_SIZE;
+
+	mt2 = mt1[idx1];
+	if(!mt1[idx1])
+	{
+		page1 = alloc_page(GFP_KERNEL);
+		mt1_lock();
+		mt2 = page1;
+	}
+	
+	mt3 = mt2[idx2];
+	if(!mt2[idx2])
+	{
+		page2 = alloc_page(GFP_KERNEL);
+		mt2_lock();
+		mt2[idx2] = page2;
+	}
+	mt3 = mt2[idx2];
+	if(!mt3[idx3])
+	{
+		page3 = alloc_page(GFP_KERNEL);
+		mt3[idx3] = page_address(page3);
+	}
+	
+	mt3[idx3] = addr;
+	
+	mt1[idx1] = page_address(page1);
+	mt1_unlock();
+	mt2_unlock();
+	mt3_unlock();
+	return entry;
+	
+	
+	
+}
+
 struct manage_map
 {
 	unsigned long long magic;
@@ -59,7 +210,11 @@ struct manage_map
 	void* start, *end;
 	void* shadow[NUMOFSHADOW];	
 	shadow_variables set[NUMOFSHADOW];
-	
+	unsigned long *table1;
+	unsigned long *table2;
+	unsigned long *tables;
+	//struct mm_struct table1_mm;
+	//struct mm_struct table2_mm;
 	struct list_head shadow_list;
 	spinlock_t list_lock;	
 };
@@ -270,14 +425,35 @@ static void copy_to_nvdisk(struct nvdisk_device *nvdisk, const void *src,
 	
 	void * start_addr = nvdisk->nvdisk_manage->start;
 	void * dst;
+
+	unsigned long addr;
 		
 	size_t copy;
+	
+	int idx = sector >> 2;
+
+	unsigned long  *primary_table, *secondary_table, *shadow_table;
+	
+	
+	
+
+#ifdef NVRAMDISK_TIMECHECK	
+	cycles_t total1, total2, pgtable_lookup1, pgtable_lookup2, pgtable_lookup3, pgtable_lookup4, pgtable_update1, pgtable_update2, lock1, lock2, shadow1, shadow2, memcpy1, memcpy2,data_flush1, data_flush2;
+	total1 = get_cycles();
+#endif
 
 	copy = min_t(size_t, n, PAGE_SIZE - offset);
 
 	//des = start_addr + ((sector>> PAGE_SECTORS_SHIFT) << PAGE_SHIFT);//////////////////////
-	des = (unsigned long long)start_addr + (unsigned long long)((sector << SECTOR_SHIFT) & (~((1<<PAGE_SHIFT)-1)));
+	addr = (unsigned long long)((sector << SECTOR_SHIFT) & (~((1<<PAGE_SHIFT)-1)));
+	des = (unsigned long long)start_addr + addr;
 	dst = (void*) des;
+
+	primary_table = nvdisk->nvdisk_manage->table1;
+	secondary_table = nvdisk->nvdisk_manage->table2;
+	shadow_table = nvdisk->nvdisk_manage->tables;
+	
+
 	/////////////////////////test test test///////////////////////////
 	/*printk(KERN_ALERT"memcpy1");
 	memcpy(dst+offset, src, copy);
@@ -310,7 +486,9 @@ static void copy_to_nvdisk(struct nvdisk_device *nvdisk, const void *src,
 		//memcpy(des_addr, src, size);
 		return;
 	}*/
-
+#ifdef NVRAMDISK_TIMECHECK	
+	pgtable_lookup1 = get_cycles();
+#endif
 	pgd = pgd_offset_k(des_addr);
 	pud = pud_alloc(&init_mm, pgd, des_addr);
 	pmd = pmd_alloc(&init_mm, pud, des_addr);
@@ -319,6 +497,10 @@ static void copy_to_nvdisk(struct nvdisk_device *nvdisk, const void *src,
 
 	pte_temp = *pte;
 	page_dest = pte_page(pte_temp);//get page descriptor of des addr
+#ifdef NVRAMDISK_TIMECHECK	
+	pgtable_lookup2 = get_cycles();
+#endif
+
 	if(page_dest == NULL)
 	{
 		printk(KERN_ALERT"nvrdisk: page_dest NULL");
@@ -337,6 +519,10 @@ static void copy_to_nvdisk(struct nvdisk_device *nvdisk, const void *src,
 	
 
 	//down(&shadow_sem);
+#ifdef NVRAMDISK_TIMECHECK	
+	shadow1 = get_cycles();
+#endif
+
 	spin_lock(&map->list_lock);
 	if(list_empty(&map->shadow_list))
 	{
@@ -355,11 +541,27 @@ static void copy_to_nvdisk(struct nvdisk_device *nvdisk, const void *src,
 		list_del(&working_list->list);
 		spin_unlock(&map->list_lock);
 	}
-	
-	//clk_end = get_cycles();
+#ifdef NVRAMDISK_TIMECHECK	
+	shadow2 = get_cycles();
+#endif
 	//pram_info("Shadow Get = %ld\n",clk_end-clk_start);
 	
-	
+#ifdef NVRAMDISK_TIMECHECK	
+	pgtable_lookup3 = get_cycles();
+#endif
+
+#ifdef NVRAMDISK_FINE_GRAINED_LOCKING
+	lv_table_update(index, des_addr);
+#elif
+	spin_lock();
+#endif
+
+#ifdef NVRAMDISK_FINE_GRAINED_LOCKING
+	lv_table_clear(index);
+#elif
+	spin_unlock();
+#endif
+
 	shadow_addr = map->shadow[index];
 	//clk_start = get_cycles();	
 	pgd_s = pgd_offset_k(shadow_addr);
@@ -379,17 +581,34 @@ static void copy_to_nvdisk(struct nvdisk_device *nvdisk, const void *src,
 	//printk(KERN_ALERT"va(des_addr)=%x", __va(PFN_PHYS(page_to_pfn(page_dest))));
 	//printk(KERN_ALERT"shadow_addr=%x", shadow_addr);
 	//printk(KERN_ALERT"va(shadow_addr)=%x", dst);
-	
+#ifdef NVRAMDISK_TIMECHECK	
+	pgtable_lookup4 = get_cycles();
+#endif
+
+#ifdef NVRAMDISK_TIMECHECK	
+	memcpy1 = get_cycles();
+#endif
+
 	memcpy(dst, __va(PFN_PHYS(page_to_pfn(page_dest))), offset);
 	//memcpy(__va(PFN_PHYS(page_to_pfn(page_shadow)))+offset, src, copy);
 	memcpy(dst + offset, src, copy);
 	memcpy(dst + offset + copy, __va(PFN_PHYS(page_to_pfn(page_dest)))+offset+copy, PAGE_SIZE-(copy+offset));
-	//__inline_memcpy((void*)shadow_addr, src, size);
-	//clk_end = get_cycles();
-	//pram_info("memcpy() = %ld\n",clk_end-clk_start);
-	//clk_start = get_cycles();	
-	clflush_cache_range(dst, 4096);
+#ifdef NVRAMDISK_TIMECHECK	
+	memcpy2 = get_cycles();
+#endif
 	
+
+#ifdef NVRAMDISK_TIMECHECK
+	data_flush1 = get_cycles();
+#endif
+
+	clflush_cache_range(dst, 4096);
+#ifdef NVRAMDISK_TIMECHECK
+	data_flush2 = get_cycles();
+#endif
+#ifdef NVRAMDISK_TIMECHECK
+	pgtable_update1 = get_cycles();
+#endif
 	map->set[index].l2 = des_addr;
 	clflush_cache_range(&map->set[index], sizeof(shadow_variables));
 	set_pte_at(&init_mm, des_addr, pte, mk_pte(page_shadow, prot));
@@ -399,10 +618,30 @@ static void copy_to_nvdisk(struct nvdisk_device *nvdisk, const void *src,
 	map->set[index].l1=0;
 	//spin_lock(&init_mm.page_table_lock);
 	set_pte_at(&init_mm, shadow_addr, pte_s, tmp);
-	
+
+#ifdef NVRAMDISK_TIMECHECK
+	pgtable_update2 = get_cycles();
+#endif
+
+#ifdef NVRAMDISK_TIMECHECK
+	lock1 = get_cycles();
+#endif
 	spin_lock(&map->list_lock);
 	list_add(&working_list->list, &map->shadow_list);
 	spin_unlock(&map->list_lock);
+	
+#ifdef NVRAMDISK_TIMECHECK
+	lock2 = get_cycles();
+#endif
+
+
+#ifdef NVRAMDISK_TIMECHECK	
+	total2 = get_cycles();
+#endif
+
+#ifdef NVRAMDISK_TIMECHECK	
+	printk(KERN_ALERT"%dB total:%d lookup:%d shadow:%d update:%d memcpy:%d flush:%d\n", n, total2-total1, (pgtable_lookup2-pgtable_lookup1) + (pgtable_lookup4-pgtable_lookup3), (shadow2-shadow1) + (lock2-lock1), pgtable_update2-pgtable_update1, memcpy2-memcpy1, data_flush2-data_flush1 );
+#endif
 	//printk(KERN_ALERT"-----------AFTER-------------");	
 	//printk(KERN_ALERT"des_addr=%x", des);	
 	//printk(KERN_ALERT"=%x", __va(PFN_PHYS(page_to_pfn(page_dest))));
@@ -410,7 +649,7 @@ static void copy_to_nvdisk(struct nvdisk_device *nvdisk, const void *src,
 	//printk(KERN_ALERT"dst=%x", __va(PFN_PHYS(page_to_pfn(page_shadow))));
 	//up(&shadow_sem);
 	
-	return;
+	//return;
 	
 	if (copy < n) {
 		src += copy;
@@ -525,7 +764,7 @@ static void copy_to_nvdisk(struct nvdisk_device *nvdisk, const void *src,
 		
 	}
 
-	
+
 }
 
 /*
@@ -571,12 +810,19 @@ static void copy_from_nvdisk(void *dst, struct nvdisk_device *nvdisk,
 	struct page * page_src;
 	void *src;
 	unsigned int offset = (sector & (PAGE_SECTORS-1)) << SECTOR_SHIFT;
+	int idx = sector >> 2;
 	size_t copy;
-
+	unsigned long  *primary_table, *secondary_table, *shadow_table;
+	
+	primary_table = nvdisk->nvdisk_manage->table1;
+	secondary_table = nvdisk->nvdisk_manage->table2;
+	shadow_table = nvdisk->nvdisk_manage->tables;
+	
 	copy = min_t(size_t, n, PAGE_SIZE - offset);
 	//printk(KERN_ALERT"nvdisk: offset = %x", offset);
 	//addr = nvdisk->nvdisk_manage->start + ((sector>> PAGE_SECTORS_SHIFT) << PAGE_SHIFT);// & (~0x111); 
 	addr = (unsigned long long)nvdisk->nvdisk_manage->start + (unsigned long long)((sector << SECTOR_SHIFT) & (~((1<<PAGE_SHIFT)-1)));
+	
 	//printk(KERN_ALERT"nvdisk: addr = %x", addr);
 	src = (void*)addr;
 	//printk(KERN_ALERT"nvdisk: src = %x", src);
@@ -602,6 +848,15 @@ static void copy_from_nvdisk(void *dst, struct nvdisk_device *nvdisk,
 	printk(KERN_ALERT"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
 	*/
 	/////////////////////////test test test///////////////////////////
+	if(primary_table[idx])
+	{
+		src = primary_table[idx];
+		memcpy(dst, src+offset, copy);
+	}
+	else
+	{
+		memset(dst, 0, copy);
+	}
 	
 	pgd = pgd_offset_k(addr);
 	pud = pud_alloc(&init_mm, pgd, addr);
@@ -817,7 +1072,8 @@ static struct nvdisk_device *nvdisk_alloc(int i)
 	
 	struct manage_map* nvdisk_manage;
 	void * shadow_start;
-	
+	unsigned long *t1;
+	unsigned long *t2;
 	nvdisk = kzalloc(sizeof(*nvdisk), GFP_KERNEL);
 	if (!nvdisk)
 		goto out;
@@ -854,6 +1110,18 @@ static struct nvdisk_device *nvdisk_alloc(int i)
 	nvdisk_manage = kzalloc(sizeof(struct manage_map), GFP_ATOMIC);
 	nvdisk->nvdisk_manage = nvdisk_manage;
 	nvdisk->nvdisk_manage->start = vmalloc(nvrd_size*512);
+	nvdisk->nvdisk_manage->table1=alloc_page(GFP_KERNEL);
+	nvdisk->nvdisk_manage->table2=alloc_page(GFP_KERNEL);
+
+	//nvdisk->nvdisk_manage->table1_mm->pgd = alloc_pg
+	t1=nvdisk->nvdisk_manage->table1;
+	t2=nvdisk->nvdisk_manage->table2;
+	for(i=0; i<PAGE_SIZE/sizeof(unsigned long);i++)
+	{
+		t1[i]=0;
+		t2[i]=0;
+	}
+	nvdisk->nvdisk_manage->table2=alloc_page(GFP_KERNEL);
 	printk(KERN_ALERT"nvdisk: partition alloc %x", nvdisk->nvdisk_manage->start);
 	nvdisk->nvdisk_manage->	shadow_start = vmalloc(PAGE_SIZE * NUMOFSHADOW);
 	printk(KERN_ALERT"nvdisk: shadow block alloc %x", nvdisk->nvdisk_manage->shadow_start);
@@ -873,6 +1141,9 @@ static struct nvdisk_device *nvdisk_alloc(int i)
 		nvdisk_manage->set[i].l2 = 0;		
 	}
 	printk(KERN_ALERT"nvdisk: spinlock init");
+	nvramdisk_mapping_table_init(nvdisk);
+	lv_table_init();
+	subset_lock_init();
 	spin_lock_init(&nvdisk->nvdisk_manage->list_lock);
 
 	return nvdisk;
@@ -1014,6 +1285,30 @@ static void __exit nvdisk_exit(void)
 	blk_unregister_region(MKDEV(NVRAMDISK_MAJOR, 0), range);
 	unregister_blkdev(NVRAMDISK_MAJOR, "nvramdisk");
 }
+int nvramdisk_mapping_table_init(struct nvdisk_device* nvdisk)
+{
+	int size = nvrd_size*512;
+	int table_size = size / sizeof(unsigned long);
+	nvdisk->nvdisk_manage->table1=kzalloc(table_size, GFP_KERNEL);
+	nvdisk->nvdisk_manage->table2=kzalloc(table_size, GFP_KERNEL);
+	nvdisk->nvdisk_manage->tables=kzalloc(NUMOFSHADOW*sizeof(unsigned long), GFP_KERNEL);
+}
+
+void subset_lock_init()
+{
+	//lock √ ±‚»≠ size / subset
+	int cache_line_size;
+	int n;
+	int i;
+	n = nvrd_size * 512 / cache_line_size;
+	nvramdisk_tslock = kmalloc(sizeof(spinlock_t) * n, GFP_KERNEL);
+	for(i=0; i<n; i++)
+	{
+		spin_lock_init(&nvramdisk_tslock[i]);
+	}	
+	
+}
+
 
 module_init(nvdisk_init);
 module_exit(nvdisk_exit);
